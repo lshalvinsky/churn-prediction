@@ -1,6 +1,6 @@
 ---
 title: "Churn Prediction & Behavioral Segmentation"
-author: "Customer Analytics Demo"
+author: "lshalvinsky"
 output:
   html_document:
     toc: true

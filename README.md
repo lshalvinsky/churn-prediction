@@ -1,5 +1,7 @@
 # Churn Prediction & Behavioral Segmentation
 
+**Contributor:** [lshalvinsky](https://github.com/lshalvinsky)
+
 A reproducible R project that creates synthetic customer and marketing data,
 discovers behavioral customer segments, predicts 90-day churn, and turns model
 scores into retention targeting priorities. It is a teaching example; all
