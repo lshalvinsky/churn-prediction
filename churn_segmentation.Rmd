@@ -1,0 +1,224 @@
+---
+title: "Churn Prediction & Behavioral Segmentation"
+author: "Customer Analytics Demo"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+for (file in c("data.R", "segmentation.R", "churn_model.R")) {
+  source(file.path("R", file))
+}
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  stop("Install ggplot2 before knitting this workbook.")
+}
+library(ggplot2)
+set.seed(42)
+```
+
+## Business question
+
+Which customers are most likely to stop purchasing in the next 90 days, and how
+can marketing prioritize a practical retention audience? This example uses
+fully synthetic retail customer data. Its hidden persona labels support
+simulation checks and are excluded from both segmentation inputs and the churn
+prediction features.
+
+## 1. Create and inspect the mock marketing data
+
+```{r data}
+customers <- load_customers()
+dim(customers)
+head(customers)
+summary(customers[c("age", "tenure_months", "recency_days", "frequency_12m",
+                    "monetary_12m", "discount_usage_rate", "nps_score",
+                    "churned_90d")])
+```
+
+The table combines customer attributes, purchasing history, digital-channel
+activity, email engagement, service contacts, campaign response, and a
+simulated 90-day churn outcome. The churn event is generated from the observed
+historical risk signals, plus unobserved individual variation and a source
+persona effect.
+
+```{r persona-check}
+persona_summary <- aggregate(
+  cbind(recency_days, frequency_12m, monetary_12m, churned_90d,
+        responded_campaign) ~ true_persona,
+  data = customers, FUN = mean
+)
+persona_summary
+```
+
+## 2. RFM baseline
+
+Rank-based quintiles make the RFM scores robust to ties. Recency is reversed so
+that a high R score means a more recent purchase.
+
+```{r rfm}
+customers <- cbind(customers, rfm_scores(customers))
+customers$rfm_segment <- cut(
+  customers$rfm_score,
+  breaks = c(2, 6, 9, 12, 15),
+  labels = c("Low", "Developing", "Strong", "Top"),
+  include.lowest = TRUE
+)
+aggregate(churned_90d ~ rfm_segment, customers, mean)
+```
+
+RFM gives a useful, explainable baseline, but it cannot distinguish channel
+preferences, campaign responsiveness, and other behaviors that may be useful
+for customer strategy.
+
+## 3. Behavioral segmentation
+
+Segments use purchase recency, frequency, order value, discount usage, digital
+activity, email engagement, service contacts, and NPS. Skewed measures are
+log-transformed and all inputs standardized. Churn outcomes and hidden personas
+are deliberately excluded.
+
+```{r segment}
+customers <- fit_segments(customers, k = 5, seed = 42)
+table(customers$segment)
+```
+
+```{r segment-profile}
+profiles <- segment_profile(customers)
+profiles
+```
+
+```{r segment-plot}
+ggplot(profiles, aes(x = reorder(segment, churn_rate), y = churn_rate, fill = segment)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Observed 90-day churn rate by behavioral segment",
+       x = NULL, y = "Churn rate") +
+  theme_minimal()
+```
+
+The segment labels are initially numeric. Profile their typical activity,
+revenue, campaign response, and churn rate before assigning business names or
+choosing segment-specific actions.
+
+## 4. Train churn prediction models
+
+The holdout is stratified by the churn outcome. Logistic regression provides an
+interpretable baseline; a random forest can capture nonlinear behavior and
+interactions. The model uses information available before the prediction
+horizon. It does not use `churned_90d` or the hidden persona as a feature.
+
+```{r fit-models, cache=TRUE}
+if (!requireNamespace("ranger", quietly = TRUE)) {
+  stop("Install the ranger package to fit the random-forest model.")
+}
+model_fit <- train_churn_models(customers, test_fraction = 0.25, seed = 42)
+model_metrics <- data.frame(
+  model = names(model_fit$models),
+  holdout_auc = vapply(model_fit$models, `[[`, numeric(1), "auc")
+)
+classification <- do.call(rbind, lapply(names(model_fit$models), function(name) {
+  cbind(
+    model = name,
+    classification_metrics(model_fit$truth, model_fit$models[[name]]$scores)
+  )
+}))
+model_metrics
+classification
+```
+
+```{r importance}
+head(model_fit$models[["Random forest"]]$importance, 15)
+```
+
+```{r roc-plot}
+roc_points <- do.call(rbind, lapply(names(model_fit$models), function(name) {
+  scores <- model_fit$models[[name]]$scores
+  thresholds <- sort(unique(c(Inf, scores, -Inf)), decreasing = TRUE)
+  data.frame(
+    model = name,
+    fpr = vapply(thresholds, function(t) mean(scores[model_fit$truth == 0] >= t),
+                 numeric(1)),
+    tpr = vapply(thresholds, function(t) mean(scores[model_fit$truth == 1] >= t),
+                 numeric(1))
+  )
+}))
+ggplot(roc_points, aes(fpr, tpr, colour = model)) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  coord_equal() +
+  labs(title = "Holdout ROC curves", x = "False positive rate",
+       y = "True positive rate", colour = "Model") +
+  theme_minimal()
+```
+
+## 5. Retention targeting
+
+Scores are evaluated by their ability to rank future churners ahead of other
+customers. A top-quintile targeting rule is an illustrative budget constraint,
+not a universally optimal choice.
+
+```{r targeting}
+forest_scores <- model_fit$models[["Random forest"]]$scores
+deciles <- churn_deciles(model_fit$truth, forest_scores)
+deciles
+top_quintile_metrics <- top_fraction_metrics(model_fit$truth, forest_scores, 0.2)
+top_quintile_metrics
+```
+
+```{r lift-plot}
+ggplot(deciles, aes(x = decile, y = lift)) +
+  geom_col(fill = "#2a78d6") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey35") +
+  scale_x_continuous(breaks = deciles$decile) +
+  labs(title = "Churn lift by risk decile", x = "Highest-risk decile first",
+       y = "Lift over average churn rate") +
+  theme_minimal()
+```
+
+```{r score-customers}
+customers$churn_probability <- predict_churn(model_fit, customers)
+head(customers[order(-customers$churn_probability),
+               c("customer_id", "segment", "churn_probability",
+                 "recency_days", "frequency_12m", "nps_score")], 10)
+```
+
+## 6. Recommended interpretation
+
+- Validate probability calibration and ranking on a later time period before
+  activating a retention audience.
+- Compare campaign cost, contact capacity, customer value, and intervention
+  effectiveness; a high churn probability alone does not mean an offer will
+  prevent churn.
+- Test interventions using randomized holdouts and measure incremental
+  retention rather than treating predicted risk as causal evidence.
+- Monitor model performance and representation across relevant customer groups.
+
+## 7. Save reproducible outputs
+
+```{r export}
+dir.create(file.path("data", "processed"), recursive = TRUE, showWarnings = FALSE)
+dir.create("reports", recursive = TRUE, showWarnings = FALSE)
+utils::write.csv(
+  customers[c("customer_id", "segment", "R", "F", "M", "churn_probability")],
+  file.path("data", "processed", "customer_churn_scores.csv"),
+  row.names = FALSE
+)
+utils::write.csv(profiles, file.path("reports", "segment_profiles.csv"),
+                 row.names = FALSE)
+utils::write.csv(deciles, file.path("reports", "churn_deciles.csv"),
+                 row.names = FALSE)
+utils::write.csv(model_metrics, file.path("reports", "model_metrics.csv"),
+                 row.names = FALSE)
+utils::write.csv(
+  classification, file.path("reports", "classification_metrics.csv"),
+  row.names = FALSE
+)
+message("Saved scored customers, segment profiles, deciles, and model metrics.")
+```

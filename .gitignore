@@ -1,0 +1,10 @@
+.Rhistory
+.RData
+.Rproj.user/
+data/raw/*.csv
+data/processed/*.csv
+reports/*.html
+reports/*.png
+churn_segmentation.html
+churn_segmentation_cache/
+Rplots.pdf
